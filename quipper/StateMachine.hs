@@ -1,24 +1,8 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE LambdaCase #-}
--- ============================================================
--- StateMachine.hs — Panic-Mode FSM in Quipper / Haskell
---
--- Classical state machine with a two-qubit quantum encoding.
--- The state transitions are purely classical (deterministic FSM).
--- The qubit encoding provides a mapping for future quantum circuit expansion.
---
--- States (2-qubit encoding):
---   Normal    = (false, false) = 00
---   Overload  = (false, true)  = 01
---   Recovery  = (true,  false) = 10
---   Escalate  = (true,  true)  = 11
--- ============================================================
 
 import Quipper
 import QuipperLib.Classical
-import Data.IORef
-import Control.Monad (forM_)
 
 -- ─────────────────────────────────────────────
 -- State & Event types
@@ -27,17 +11,11 @@ import Control.Monad (forM_)
 data State = Normal | Overload | Recovery | Escalate
   deriving (Eq, Show)
 
-data Event
-  = Shift
-  | Reduce
-  | NoAction
-  | Sync
-  | EscalateReq
-  | Timeout
+data Event = Shift | Reduce | NoAction | Sync | EscalateReq | Timeout
   deriving (Eq, Show)
 
 -- ─────────────────────────────────────────────
--- Classical encoding helpers
+-- Classical helpers
 -- ─────────────────────────────────────────────
 
 stateToBits :: State -> (Bit, Bit)
@@ -53,131 +31,89 @@ bitsToState (b1, b2)
   | b1 == true  && b2 == false = Recovery
   | otherwise                  = Escalate
 
--- ─────────────────────────────────────────────
--- Classical transition function
--- ─────────────────────────────────────────────
+-- Encode event as Int 0–5
+eventToInt :: Event -> Int
+eventToInt Shift       = 0
+eventToInt Reduce      = 1
+eventToInt NoAction    = 2
+eventToInt Sync        = 3
+eventToInt EscalateReq = 4
+eventToInt Timeout     = 5
 
-nextState :: State -> Event -> State
-nextState Normal   Shift       = Normal
-nextState Normal   Reduce      = Normal
-nextState Normal   NoAction    = Overload
+-- Classical transition table
+nextState :: State -> Int -> State
+nextState Normal   0 = Normal
+nextState Normal   1 = Normal
+nextState Normal   2 = Overload
 
-nextState Overload NoAction    = Recovery
-nextState Overload EscalateReq = Escalate
+nextState Overload 2 = Recovery
+nextState Overload 4 = Escalate
 
-nextState Recovery Sync        = Normal
-nextState Recovery Timeout     = Escalate
+nextState Recovery 3 = Normal
+nextState Recovery 5 = Escalate
 
-nextState Escalate _           = Escalate  -- terminal
-
--- ─────────────────────────────────────────────
--- Deferred buffer (classical IO)
--- ─────────────────────────────────────────────
-
-type Buffer = IORef [Event]
-
-newBuffer :: IO Buffer
-newBuffer = newIORef []
-
-enqueue :: Buffer -> Event -> IO ()
-enqueue buf ev = modifyIORef buf (++ [ev])
-
-dequeue :: Buffer -> IO (Maybe Event)
-dequeue buf = do
-  evs <- readIORef buf
-  case evs of
-    []     -> return Nothing
-    (e:es) -> writeIORef buf es >> return (Just e)
-
-drainBuffer :: Buffer -> (Event -> IO ()) -> IO ()
-drainBuffer buf process = do
-  ev <- dequeue buf
-  case ev of
-    Nothing -> return ()
-    Just e  -> process e >> drainBuffer buf process
+nextState Escalate _ = Escalate  -- terminal
 
 -- ─────────────────────────────────────────────
--- Classical FSM runner (IO)
+-- Quipper circuit
+--
+-- State held in two qubits:
+--   00 = Normal   01 = Overload
+--   10 = Recovery 11 = Escalate
+--
+-- One step: initialise state qubits, compute next state classically,
+-- re-init to new state, measure.
 -- ─────────────────────────────────────────────
 
-data Machine = Machine
-  { machState  :: IORef State
-  , machBuffer :: Buffer
-  , machLog    :: IORef [String]
-  }
+stateMachineCircuit :: Circ (Bit, Bit)
+stateMachineCircuit = do
+  -- 1. Start in NORMAL
+  curStateQ <- qinit (false, false)
 
-newMachine :: IO Machine
-newMachine = Machine <$> newIORef Normal <*> newBuffer <*> newIORef []
+  -- 2. Event: NO_ACTION (binary 010 = 2) -> NORMAL -> OVERLOAD
+  evQ <- qinit (false, true, false)
 
-logEntry :: Machine -> String -> IO ()
-logEntry m s = modifyIORef (machLog m) (++ [s])
+  -- 3. Compute next state classically
+  let curState = bitsToState (classical id curStateQ)
+      evInt    = 2   -- NoAction
+      newState = nextState curState evInt
 
-processEvent :: Machine -> Event -> IO ()
-processEvent m ev = do
-  st <- readIORef (machState m)
-  let next = nextState st ev
-  let msg  = show st ++ " --" ++ show ev ++ "--> " ++ show next
-  logEntry m msg
-  writeIORef (machState m) next
-  -- Buffer non-SYNC/TIMEOUT events during RECOVERY
-  case (st, ev) of
-    (Recovery, Sync)    -> drainBuffer (machBuffer m) (processEvent m)
-    (Recovery, Timeout) -> return ()
-    (Recovery, _)       -> enqueue (machBuffer m) ev >> logEntry m ("  buffered: " ++ show ev)
-    _                   -> return ()
+  -- 4. Re-init state qubits to new state
+  let (nb1, nb2) = stateToBits newState
+  newStateQ <- qinit (nb1, nb2)
 
-printLog :: Machine -> IO ()
-printLog m = do
-  entries <- readIORef (machLog m)
-  mapM_ putStrLn entries
+  -- 5. Measure
+  m1 <- measure (fst newStateQ)
+  m2 <- measure (snd newStateQ)
 
--- ─────────────────────────────────────────────
--- Quipper circuit: two-qubit state encoding
--- ─────────────────────────────────────────────
-
--- Classical-in-quantum: initialise state qubits to a given State,
--- apply one event transition, return new state qubits.
-stateMachineStep :: State -> Event -> Circ (Bit, Bit)
-stateMachineStep initState ev = do
-  let (b1, b2)       = stateToBits initState
-  let newS           = nextState initState ev
-  let (nb1, nb2)     = stateToBits newS
-  stateQ  <- qinit (b1,  b2)
-  nextQ   <- qinit (nb1, nb2)
-  -- Measure to extract classical outcome
-  m1 <- measure (fst nextQ)
-  m2 <- measure (snd nextQ)
   return (m1, m2)
 
--- Full circuit: Normal --NoAction--> Overload --NoAction--> Recovery --Sync--> Normal
--- Demonstrates the three-step overload-recovery cycle as a quantum circuit.
+-- Full overload-recovery cycle circuit:
+-- NORMAL --NoAction--> OVERLOAD --NoAction--> RECOVERY --Sync--> NORMAL
 overloadRecoveryCycle :: Circ (Bit, Bit, Bit, Bit, Bit, Bit)
 overloadRecoveryCycle = do
-  -- Step 1: NORMAL --NoAction--> OVERLOAD
-  (s1a, s1b) <- stateMachineStep Normal   NoAction
-  -- Step 2: OVERLOAD --NoAction--> RECOVERY
-  (s2a, s2b) <- stateMachineStep Overload NoAction
-  -- Step 3: RECOVERY --Sync--> NORMAL
-  (s3a, s3b) <- stateMachineStep Recovery Sync
-  return (s1a, s1b, s2a, s2b, s3a, s3b)
+  -- Step 1
+  let s1 = nextState Normal   2  -- NoAction
+  let (s1b1, s1b2) = stateToBits s1
+  q1 <- qinit (s1b1, s1b2)
+  m1a <- measure (fst q1)
+  m1b <- measure (snd q1)
 
--- ─────────────────────────────────────────────
--- Main
--- ─────────────────────────────────────────────
+  -- Step 2
+  let s2 = nextState Overload 2  -- NoAction
+  let (s2b1, s2b2) = stateToBits s2
+  q2 <- qinit (s2b1, s2b2)
+  m2a <- measure (fst q2)
+  m2b <- measure (snd q2)
+
+  -- Step 3
+  let s3 = nextState Recovery 3  -- Sync
+  let (s3b1, s3b2) = stateToBits s3
+  q3 <- qinit (s3b1, s3b2)
+  m3a <- measure (fst q3)
+  m3b <- measure (snd q3)
+
+  return (m1a, m1b, m2a, m2b, m3a, m3b)
 
 main :: IO ()
-main = do
-  putStrLn "=== Classical FSM trace ==="
-  m <- newMachine
-  mapM_ (processEvent m)
-    [ Shift, Shift, NoAction   -- NORMAL x2, then OVERLOAD
-    , NoAction                  -- RECOVERY
-    , Sync                      -- NORMAL (buffer drained)
-    , NoAction                  -- OVERLOAD again
-    , EscalateReq               -- ESCALATE (terminal)
-    ]
-  printLog m
-
-  putStrLn ""
-  putStrLn "=== Quipper circuit preview: overload-recovery cycle ==="
-  print_generic Preview overloadRecoveryCycle
+main = print_generic Preview stateMachineCircuit
