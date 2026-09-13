@@ -1,0 +1,10 @@
+cabal-version: 2.4
+name:          panic-mode-fsm
+version:       0.1.0
+description:   Panic-mode state machine in Quipper / Haskell
+
+executable panic-fsm
+  main-is:          StateMachine.hs
+  build-depends:    base >= 4.14, quipper >= 0.9, quipper-utils
+  default-language: Haskell2010
+  ghc-options:      -Wall
